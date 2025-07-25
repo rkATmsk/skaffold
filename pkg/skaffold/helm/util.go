@@ -20,6 +20,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"archive/tar"
+	"compress/gzip"
+	"os/exec"
+	"path/filepath"
+	"io"
 
 	"github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/graph"
 	"github.com/GoogleContainerTools/skaffold/v2/pkg/skaffold/schema/latest"
@@ -118,4 +123,90 @@ func ReleaseNamespace(namespace string, release latest.HelmRelease) (string, err
 		return namespace, nil
 	}
 	return "", nil
+}
+
+// PullAndExtractChartFile pulls a remote Helm chart and extracts a file from it (e.g., values-prod.yaml).
+// chartRef: the remote chart reference (e.g., oci://...)
+// version: the chart version
+// fileInChart: the file to extract (e.g., values-prod.yaml)
+// Returns the path to the extracted file, and a cleanup function.
+func PullAndExtractChartFile(chartRef, version, fileInChart string) (string, func(), error) {
+	tmpDir, err := os.MkdirTemp("", "skaffold-helm-pull-*")
+	if err != nil {
+		return "", nil, err
+	}
+	cleanup := func() { os.RemoveAll(tmpDir) }
+
+	// Pull the chart
+	pullArgs := []string{"pull", chartRef, "--version", version, "--destination", tmpDir}
+	cmd := exec.Command("helm", pullArgs...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("failed to pull chart: %v\n%s", err, string(out))
+	}
+
+	// Find the .tgz file
+	var tgzPath string
+	dirEntries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	for _, entry := range dirEntries {
+		if filepath.Ext(entry.Name()) == ".tgz" {
+			tgzPath = filepath.Join(tmpDir, entry.Name())
+			break
+		}
+	}
+	if tgzPath == "" {
+		cleanup()
+		return "", nil, fmt.Errorf("no chart archive found after helm pull")
+	}
+
+	// Extract the requested file
+	tgzFile, err := os.Open(tgzPath)
+	if err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	defer tgzFile.Close()
+	gzReader, err := gzip.NewReader(tgzFile)
+	if err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	tarReader := tar.NewReader(gzReader)
+
+	var extractedPath string
+	for {
+		hdr, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			cleanup()
+			return "", nil, err
+		}
+		// Chart files are inside a top-level dir, e.g. united/values-prod.yaml
+		if filepath.Base(hdr.Name) == fileInChart {
+			extractedPath = filepath.Join(tmpDir, fileInChart)
+			outFile, err := os.Create(extractedPath)
+			if err != nil {
+				cleanup()
+				return "", nil, err
+			}
+			if _, err := io.Copy(outFile, tarReader); err != nil {
+				outFile.Close()
+				cleanup()
+				return "", nil, err
+			}
+			outFile.Close()
+			break
+		}
+	}
+	if extractedPath == "" {
+		cleanup()
+		return "", nil, fmt.Errorf("file %s not found in chart", fileInChart)
+	}
+	return extractedPath, cleanup, nil
 }
